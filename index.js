@@ -29,21 +29,62 @@ async function fetchWithRetry(url, options = {}, retries = 3, backoff = 1000) {
         ...fetchOptions,
         signal: controller.signal
       });
-      
+
       clearTimeout(id);
       return response;
     } catch (err) {
       clearTimeout(id);
       const isLastAttempt = i === retries - 1;
-      
+
       if (isLastAttempt) throw err;
-      
-      // Attente exponentielle avant la prochaine tentative
+
       const delay = backoff * Math.pow(2, i);
       console.error(`Tentative ${i + 1} échouée, nouvel essai dans ${delay}ms...`);
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
+}
+
+/**
+ * Recherche sémantique avec fallback automatique sur le score de similarité.
+ * Si aucun résultat à `minScore`, on retente à `fallbackScore`.
+ */
+async function semanticSearch({ query, tags, maxResults = 5, minScore = 0.7, fallbackScore = 0.5 }) {
+  const doSearch = async (score) => {
+    const res = await fetchWithRetry(`${RAG_BASE_URL}/api/Search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query,
+        tags,
+        maxResults,
+        minSimilarityScore: score,
+        includeMetadata: true,
+      }),
+      timeout: 30000
+    }, 3);
+
+    if (!res.ok) {
+      const errorText = await res.text();
+      throw new Error(`Erreur API NAS (${res.status}): ${errorText}`);
+    }
+
+    return res.json();
+  };
+
+  console.error(`DEBUG semantic_search: query="${query}", minScore=${minScore}`);
+
+  let data = await doSearch(minScore);
+
+  // Fallback si aucun résultat avec le score initial
+  if ((!data.results || data.results.length === 0) && fallbackScore < minScore) {
+    console.error(`Aucun résultat à ${minScore}, fallback à ${fallbackScore}...`);
+    data = await doSearch(fallbackScore);
+    data._usedFallback = true;
+    data._fallbackScore = fallbackScore;
+  }
+
+  return data;
 }
 
 /**
@@ -72,16 +113,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "semantic_search",
-        description: "Recherche sémantique dans la documentation MO5 (base de connaissances)",
+        description: "Recherche sémantique dans la documentation MO5 (base de connaissances). Si aucun résultat n'est trouvé avec le score demandé, une seconde tentative est effectuée automatiquement avec un seuil plus permissif.",
         inputSchema: {
           type: "object",
           properties: {
             query: { type: "string", description: "La question ou les mots-clés de recherche" },
             tags: { type: "array", items: { type: "string" }, description: "Filtres par thématiques" },
             maxResults: { type: "number", default: 5 },
-            minSimilarityScore: { type: "number", default: 0.7 },
+            minSimilarityScore: { type: "number", default: 0.7, description: "Score minimum de similarité (0.0 à 1.0). Un fallback automatique à 0.5 est appliqué si aucun résultat n'est trouvé." },
           },
           required: ["query"],
+        },
+      },
+      {
+        name: "get_chunk_context",
+        description: "Récupère le contexte élargi autour d'un chunk retourné par semantic_search : les chunks voisins (avant/après) dans le même document. Utile quand une explication technique est découpée sur plusieurs chunks et que la réponse semble incomplète ou tronquée.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            documentId: { type: "string", description: "L'ID du document (champ document.documentId dans les résultats de semantic_search)" },
+            chunkIndex: { type: "number", description: "L'index du chunk central (champ position.chunkIndex dans les résultats de semantic_search)" },
+            contextSize: { type: "number", default: 2, description: "Nombre de chunks à récupérer de chaque côté (défaut: 2)" },
+          },
+          required: ["documentId", "chunkIndex"],
         },
       },
       {
@@ -105,31 +159,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // --- Tool : semantic_search ---
   if (name === "semantic_search") {
     try {
-      const res = await fetchWithRetry(`${RAG_BASE_URL}/api/Search`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          query: args.query,
-          tags: args.tags,
-          maxResults: args.maxResults ?? 5,
-          minSimilarityScore: args.minSimilarityScore ?? 0.7,
-          includeMetadata: true,
-        }),
-        timeout: 30000
-      }, 3);
-
-      if (!res.ok) {
-        const errorText = await res.text();
-        throw new Error(`Erreur API NAS (${res.status}): ${errorText}`);
-      }
-
-      const data = await res.json();
-      console.error("DEBUG NAS DATA:", JSON.stringify(data).substring(0, 200));
+      const data = await semanticSearch({
+        query: args.query,
+        tags: args.tags,
+        maxResults: args.maxResults ?? 5,
+        minScore: args.minSimilarityScore ?? 0.7,
+        fallbackScore: 0.5,
+      });
 
       const results = data.results || [];
-      const text = results.length > 0
-        ? results.map(r => `${r.content}\n(Source: ${r.document?.fileName}, score: ${r.similarityScore})`).join("\n\n")
-        : "L'API a répondu avec succès mais aucun résultat n'a été trouvé.";
+
+      if (results.length === 0) {
+        return {
+          content: [{ type: "text", text: "Aucun résultat trouvé, même avec un seuil de similarité abaissé à 0.5. Essayez d'autres mots-clés ou consultez list_official_docs." }]
+        };
+      }
+
+      const fallbackNote = data._usedFallback
+        ? `⚠️ Aucun résultat au seuil demandé — résultats obtenus avec un seuil abaissé à ${data._fallbackScore} (pertinence réduite).\n\n`
+        : "";
+
+      const text = fallbackNote + results
+        .map(r =>
+          `${r.content}\n` +
+          `(Source: ${r.document?.fileName}, score: ${r.similarityScore}, ` +
+          `chunkIndex: ${r.position?.chunkIndex ?? "?"}, documentId: ${r.document?.documentId})`
+        )
+        .join("\n\n");
 
       return { content: [{ type: "text", text }] };
 
@@ -137,6 +193,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       console.error("Erreur semantic_search:", error.message);
       return {
         content: [{ type: "text", text: `Désolé, le serveur de recherche ne répond pas après plusieurs tentatives (Erreur: ${error.message}).` }],
+        isError: true
+      };
+    }
+  }
+
+  // --- Tool : get_chunk_context ---
+  if (name === "get_chunk_context") {
+    try {
+      const { documentId, chunkIndex, contextSize = 2 } = args;
+
+      const res = await fetchWithRetry(`${RAG_BASE_URL}/api/Documents/${documentId}`, {
+        timeout: 15000
+      }, 3);
+
+      if (!res.ok) throw new Error(`Document introuvable (${res.status})`);
+
+      const doc = await res.json();
+      const chunks = doc.chunks ?? [];
+
+      if (chunks.length === 0) {
+        return { content: [{ type: "text", text: "Ce document ne contient aucun chunk accessible." }] };
+      }
+
+      const minIndex = Math.max(0, chunkIndex - contextSize);
+      const maxIndex = Math.min(chunks.length - 1, chunkIndex + contextSize);
+
+      const window = chunks
+        .filter(c => c.chunkIndex >= minIndex && c.chunkIndex <= maxIndex)
+        .sort((a, b) => a.chunkIndex - b.chunkIndex);
+
+      const text =
+        `Contexte élargi — document : ${doc.fileName} (chunks ${minIndex} à ${maxIndex})\n\n` +
+        window.map(c =>
+          `--- Chunk ${c.chunkIndex}` +
+          `${c.chunkIndex === chunkIndex ? " [chunk central]" : ""}` +
+          `${c.sectionHeading ? ` — ${c.sectionHeading}` : ""} ---\n${c.content}`
+        ).join("\n\n");
+
+      return { content: [{ type: "text", text }] };
+
+    } catch (error) {
+      console.error("Erreur get_chunk_context:", error.message);
+      return {
+        content: [{ type: "text", text: `Impossible de récupérer le contexte du chunk (Erreur: ${error.message}).` }],
         isError: true
       };
     }
@@ -298,9 +398,12 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
         content: {
           type: "text",
           text: `Tu es un expert du micro-ordinateur Thomson MO5.
-Tu as accès à deux types de sources :
-1. **semantic_search** : recherche sémantique dans les chunks indexés de la base documentaire.
-2. **list_official_docs** : liste les documents officiels disponibles (manuels, guides de développement), avec résumés, tags et liens de téléchargement. Utilise cet outil en premier quand l'utilisateur cherche une référence précise (ex: "le manuel BASIC", "la doc du 6809"), puis oriente ta recherche sémantique avec les tags pertinents.
+Tu as accès aux outils suivants, à utiliser dans cet ordre selon le besoin :
+
+1. **list_official_docs** : commence par cet outil quand l'utilisateur cherche une référence précise (manuel BASIC, doc du 6809, format disquette...). Il liste les documents officiels avec résumés, tags et liens de téléchargement.
+2. **semantic_search** : recherche sémantique dans les chunks indexés. Utilise les tags identifiés via list_official_docs pour affiner. Un fallback automatique est appliqué si aucun résultat n'est trouvé au seuil demandé.
+3. **get_chunk_context** : si un résultat de semantic_search semble incomplet ou tronqué, utilise cet outil pour récupérer les chunks voisins du même document (documentId + chunkIndex sont fournis dans chaque résultat).
+
 Cite toujours tes sources (fileName, score de similarité) et propose les liens de téléchargement quand c'est pertinent.`
         }
       }
