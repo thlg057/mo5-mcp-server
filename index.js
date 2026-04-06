@@ -10,9 +10,45 @@ import {
   ListPromptsRequestSchema,
   GetPromptRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
+import { spawn } from "child_process";
+import { fileURLToPath } from "url";
+import path from "path";
 
 // Récupération de l'URL du NAS avec fallback
 const RAG_BASE_URL = process.env.RAG_BASE_URL ?? "http://nas:8080";
+
+// Répertoire des scripts Python (relatif à index.js)
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const SCRIPTS_DIR = path.join(__dirname, "scripts");
+
+/**
+ * Exécute un script Python et retourne { stdout, stderr }
+ * Rejette avec l'erreur complète si le code de sortie est non-zéro.
+ */
+function runScript(scriptName, args) {
+  return new Promise((resolve, reject) => {
+    const scriptPath = path.join(SCRIPTS_DIR, scriptName);
+    const child = spawn("python3", [scriptPath, ...args]);
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (d) => { stdout += d; });
+    child.stderr.on("data", (d) => { stderr += d; });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(new Error(`Exit ${code}\n${stderr || stdout}`));
+      }
+    });
+
+    child.on("error", (err) => {
+      reject(new Error(`Impossible de lancer python3 : ${err.message}`));
+    });
+  });
+}
 
 /**
  * Utilitaire fetch avec Timeout et Retry
@@ -111,6 +147,7 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
+      // --- Outils RAG ---
       {
         name: "semantic_search",
         description: "Recherche sémantique dans la documentation MO5 (base de connaissances). Si aucun résultat n'est trouvé avec le score demandé, une seconde tentative est effectuée automatiquement avec un seuil plus permissif.",
@@ -148,6 +185,63 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: [],
         },
+      },
+
+      // --- Outils de build MO5 ---
+      {
+        name: "make_fd",
+        description: "Génère une image disquette .fd bootable pour Thomson MO5 à partir d'un ou plusieurs binaires compilés avec CMOC. Le boot loader MO5 est embarqué directement dans le script — aucune dépendance externe requise. Équivalent de : fdfs -addBL output.fd BOOTMO.BIN program.BIN",
+        inputSchema: {
+          type: "object",
+          properties: {
+            output_fd: {
+              type: "string",
+              description: "Chemin de sortie de l'image disquette, ex: output/MYAPP.fd"
+            },
+            input_bins: {
+              type: "array",
+              items: { type: "string" },
+              description: "Liste des chemins vers les fichiers .BIN compilés avec CMOC (avec header Thomson)"
+            }
+          },
+          required: ["output_fd", "input_bins"]
+        }
+      },
+      {
+        name: "fd_to_sd",
+        description: "Convertit une image disquette .fd (format 3.5\" 720 Ko) en .sd (format 5.25\" 320 Ko) pour une utilisation avec SDDrive — le composant qui simule un lecteur de disquette sur Thomson MO5 via carte SD.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            input_fd: {
+              type: "string",
+              description: "Chemin vers le fichier .fd source, ex: output/MYAPP.fd"
+            },
+            output_sd: {
+              type: "string",
+              description: "Chemin de sortie du fichier .sd, ex: output/MYAPP.sd"
+            }
+          },
+          required: ["input_fd", "output_sd"]
+        }
+      },
+      {
+        name: "png_to_mo5_sprite",
+        description: "Convertit une image PNG en tableaux C (FORME + COULEUR) pour le Thomson MO5. Génère un fichier .h directement utilisable avec le SDK MO5 (mo5_sprite.h). Format : 1 octet = 8 pixels, 2 couleurs par groupe de 8 pixels.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            image_path: {
+              type: "string",
+              description: "Chemin vers le fichier PNG source, ex: assets/hero.png"
+            },
+            output_path: {
+              type: "string",
+              description: "Chemin de sortie du fichier .h généré, ex: include/assets/hero.h"
+            }
+          },
+          required: ["image_path", "output_path"]
+        }
       },
     ],
   };
@@ -280,6 +374,71 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   }
 
+  // --- Tool : make_fd ---
+  if (name === "make_fd") {
+    const { output_fd, input_bins } = args;
+
+    if (!Array.isArray(input_bins) || input_bins.length === 0) {
+      return {
+        content: [{ type: "text", text: "✗ Erreur : input_bins doit contenir au moins un fichier .BIN." }],
+        isError: true
+      };
+    }
+
+    try {
+      const { stdout } = await runScript("makefd.py", [output_fd, ...input_bins]);
+      return {
+        content: [{ type: "text", text: stdout.trim() || `✓ Image .fd générée : ${output_fd}` }]
+      };
+    } catch (error) {
+      console.error("Erreur make_fd:", error.message);
+      return {
+        content: [{ type: "text", text: `✗ Échec génération .fd : ${error.message}` }],
+        isError: true
+      };
+    }
+  }
+
+  // --- Tool : fd_to_sd ---
+  if (name === "fd_to_sd") {
+    const { input_fd, output_sd } = args;
+
+    try {
+      const { stdout } = await runScript("fd2sd.py", ["-conv", input_fd, output_sd]);
+      return {
+        content: [{ type: "text", text: stdout.trim() || `✓ Conversion terminée : ${output_sd}` }]
+      };
+    } catch (error) {
+      console.error("Erreur fd_to_sd:", error.message);
+      return {
+        content: [{ type: "text", text: `✗ Échec conversion .fd → .sd : ${error.message}` }],
+        isError: true
+      };
+    }
+  }
+
+  // --- Tool : png_to_mo5_sprite ---
+  if (name === "png_to_mo5_sprite") {
+    const { image_path, output_path } = args;
+
+    try {
+      const { stdout } = await runScript("png2mo5.py", [
+        image_path,
+        "--name", output_path,
+        "--quiet"
+      ]);
+      return {
+        content: [{ type: "text", text: stdout.trim() || `✓ Sprite généré : ${output_path}` }]
+      };
+    } catch (error) {
+      console.error("Erreur png_to_mo5_sprite:", error.message);
+      return {
+        content: [{ type: "text", text: `✗ Échec conversion PNG → sprite : ${error.message}` }],
+        isError: true
+      };
+    }
+  }
+
   throw new Error(`Outil inconnu : ${name}`);
 });
 
@@ -400,9 +559,15 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
           text: `Tu es un expert du micro-ordinateur Thomson MO5.
 Tu as accès aux outils suivants, à utiliser dans cet ordre selon le besoin :
 
+**Documentation (RAG)**
 1. **list_official_docs** : commence par cet outil quand l'utilisateur cherche une référence précise (manuel BASIC, doc du 6809, format disquette...). Il liste les documents officiels avec résumés, tags et liens de téléchargement.
 2. **semantic_search** : recherche sémantique dans les chunks indexés. Utilise les tags identifiés via list_official_docs pour affiner. Un fallback automatique est appliqué si aucun résultat n'est trouvé au seuil demandé.
 3. **get_chunk_context** : si un résultat de semantic_search semble incomplet ou tronqué, utilise cet outil pour récupérer les chunks voisins du même document (documentId + chunkIndex sont fournis dans chaque résultat).
+
+**Build & outils MO5**
+4. **make_fd** : génère une image disquette .fd bootable à partir d'un ou plusieurs .BIN compilés avec CMOC. Utilise-le après la compilation pour créer l'image disquette.
+5. **fd_to_sd** : convertit le .fd en .sd pour SDDrive. Utilise-le après make_fd si le fichier est destiné à une carte SD.
+6. **png_to_mo5_sprite** : convertit un PNG en fichier .h C (tableaux FORME + COULEUR) pour afficher des sprites avec le SDK MO5.
 
 Cite toujours tes sources (fileName, score de similarité) et propose les liens de téléchargement quand c'est pertinent.`
         }
