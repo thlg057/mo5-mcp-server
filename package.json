@@ -1,10 +1,10 @@
 {
   "name": "@thlg057/mo5-rag-mcp",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Serveur MCP pour le rétrocomputing Thomson MO5 (RAG et outils de build)",
   "type": "module",
   "bin": {
-    "mo5-rag-mcp": "./index.js"
+    "mo5-rag-mcp": "index.js"
   },
   "files": [
     "index.js",
@@ -26,6 +26,7 @@
   ],
   "author": "Thierry (thlg057)",
   "license": "MIT",
+  "mcpName": "io.github.thlg057/mo5-mcp-server",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"
   }
