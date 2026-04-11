@@ -1,8 +1,23 @@
 # MO5 MCP Server (RAG Connector)
 
-This MCP (Model Context Protocol) server allows an AI agent (like Claude Desktop, Augment, or Cursor) to interact with the MO5 project knowledge base via a RAG (Retrieval-Augmented Generation) API.
+This MCP server (Model Context Protocol) acts as a bridge between modern AI agents (Claude Desktop, Augment, Cursor) and the Thomson MO5 ecosystem.  
+It allows access to an expert knowledge base and manipulation of MO5 heritage files.
 
 It provides semantic search tools, documentation resources, and expert prompts to facilitate development around the Thomson MO5 microcomputer.
+
+## 🏗️ MO5 Development Ecosystem
+
+This server is part of a complete toolchain for modern 6809 development:
+
+- **SDK MO5** : https://github.com/thlg057/sdk_mo5  
+  C library optimized for CMOC.
+- **MO5 Project Template** : https://github.com/thlg057/mo5_template  
+  Project template with automated Makefile.
+- **This MCP Server** : The assistant that connects everything, answers technical questions, and generates assets.
+
+## 🌐 RAG Infrastructure (Artificial Intelligence)
+
+The server relies on a Retrieval-Augmented Generation architecture to provide accurate answers based on real technical documentation.
 
 ## 🚀 Features
 

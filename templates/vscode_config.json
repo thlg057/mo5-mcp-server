@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mo5-rag": {
+      "command": "node",
+      "args": ["[replace_by_your_path]/index.js"],
+      "env": {
+        "RAG_BASE_URL": "https://retrocomputing-ai.cloud"
+      }
+    }
+  }
+}
